@@ -986,6 +986,59 @@ class KVCacheConfigurator:
                 "model; got a non-KDA model."
             )
 
+    def _unified_dsa_geometry(self, full_layer_ids):
+        """The sparse-attention storage beside an MLA model's latent rows, or None
+        when its layers attend densely."""
+        hf_config = self.model_config.hf_config
+        if not is_deepseek_dsa(hf_config):
+            return None
+        from sglang.srt.mem_cache.kv.decl import DSAGeometry
+
+        if get_dsa_index_kpool(hf_config) != 1:
+            raise ValueError(
+                "--enable-unified-memory does not support pooled indexer keys yet; "
+                "drop --enable-unified-memory for this model."
+            )
+        if get_parallel().attn_dcp_size > 1:
+            raise ValueError(
+                "--enable-unified-memory does not support sparse attention with "
+                "decode context parallelism yet; drop --dcp-size or "
+                "--enable-unified-memory."
+            )
+        row_bytes = calculate_mla_kv_cache_dim(
+            model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
+        )
+        if (
+            self.kv_cache_dtype != torch.float8_e4m3fn
+            or row_bytes
+            == self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim
+        ):
+            raise ValueError(
+                "--enable-unified-memory serves sparse attention from FP8 latent "
+                "rows with block scales, which the flashmla_kv DSA backends read; "
+                f"this configuration stores {row_bytes}-byte "
+                f"{self.kv_cache_dtype} rows."
+            )
+        use_fp4_indexer = get_exec().kernel.enable_fp4_indexer
+        index_head_dim = get_dsa_index_head_dim(hf_config)
+        return DSAGeometry(
+            row_bytes=row_bytes,
+            scale_ue8m0=is_kimi_k31(hf_config),
+            index_head_dim=index_head_dim,
+            index_bytes_per_token=DSATokenToKVPool.index_bytes_per_token_for(
+                index_head_dim, use_fp4_indexer
+            ),
+            index_key_bytes_per_token=(
+                index_head_dim // 2 if use_fp4_indexer else index_head_dim
+            ),
+            use_fp4_indexer=use_fp4_indexer,
+            index_layer_ids=tuple(
+                layer_id
+                for layer_id in full_layer_ids
+                if not dsa_layer_skips_topk(hf_config, layer_id)
+            ),
+        )
+
     def _kv_layer_decls(self) -> tuple:
         """This runner's per-layer KV and state declarations for the unified pool."""
         from sglang.srt.mem_cache.kv.decl import (
@@ -1026,6 +1079,7 @@ class KVCacheConfigurator:
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 kv_cache_dtype=self.kv_cache_dtype,
+                dsa=self._unified_dsa_geometry(full_layer_ids),
             )
         elif has_window:
             geometry = self._unified_swa_head_geometry()

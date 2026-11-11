@@ -86,10 +86,29 @@ class MHAGeometry(msgspec.Struct, frozen=True, kw_only=True):
     kv_cache_dtype: torch.dtype
 
 
+class DSAGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """Sparse-attention storage beside MLA latent rows.
+
+    ``row_bytes`` is the stored latent row: the FP8 NoPE values with their
+    per-block scales, then the RoPE tail. Each layer in ``index_layer_ids`` (model
+    layer ids) also keeps its indexer's keys, one blob per page: the page's keys,
+    then their scales.
+    """
+
+    row_bytes: int
+    scale_ue8m0: bool
+    index_head_dim: int
+    index_bytes_per_token: int
+    index_key_bytes_per_token: int
+    use_fp4_indexer: bool
+    index_layer_ids: Tuple[int, ...]
+
+
 class MLAGeometry(msgspec.Struct, frozen=True, kw_only=True):
     kv_lora_rank: int
     qk_rope_head_dim: int
     kv_cache_dtype: torch.dtype
+    dsa: Optional[DSAGeometry] = None
 
 
 class StateReplay(msgspec.Struct, frozen=True, kw_only=True):

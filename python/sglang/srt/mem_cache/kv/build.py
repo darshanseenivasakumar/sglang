@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.kv.decl import (
     StateLifetime,
     WindowLifetime,
 )
+from sglang.srt.mem_cache.kv.layout.dsa import DSAMLASubPoolSpec, DSAMLAView
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
 from sglang.srt.mem_cache.kv.layout.state import NGramView, ShortConvView, StateView
@@ -176,6 +177,20 @@ def _build_token_view(
     ctx: UnifiedBuildContext,
 ):
     """A token sub-pool's view in its layout."""
+    if isinstance(sub_pool.spec, DSAMLASubPoolSpec):
+        dsa = sub_pool.geometry.dsa
+        return DSAMLAView(
+            arena=arena,
+            spec=sub_pool.spec,
+            kv_cache_dtype=sub_pool.geometry.kv_cache_dtype,
+            page_size=plan.page_size,
+            scale_ue8m0=dsa.scale_ue8m0,
+            index_head_dim=dsa.index_head_dim,
+            index_bytes_per_token=dsa.index_bytes_per_token,
+            index_key_bytes_per_token=dsa.index_key_bytes_per_token,
+            use_fp4_indexer=dsa.use_fp4_indexer,
+            model_layer_ids=tuple(sub_pool.layer_ids),
+        )
     if isinstance(sub_pool.spec, MLASubPoolSpec):
         # Addressed by the 0..N-1 index of its layers, so start_layer stays 0.
         return MLAView(

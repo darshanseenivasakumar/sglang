@@ -211,6 +211,25 @@ class MLAView(MLAKVView):
             f"sub-pool {spec.name!r} store dtype {spec.store_dtype} does not "
             f"match kv cache dtype {kv_cache_dtype}"
         )
+        self._init_view(
+            arena=arena,
+            spec=spec,
+            kv_cache_dtype=kv_cache_dtype,
+            store_dtype=spec.store_dtype,
+            page_size=page_size,
+            model_layer_ids=model_layer_ids,
+        )
+
+    def _init_view(
+        self,
+        *,
+        arena: "KVArena",
+        spec,
+        kv_cache_dtype: torch.dtype,
+        store_dtype: torch.dtype,
+        page_size: int,
+        model_layer_ids: Optional[Tuple[int, ...]],
+    ) -> None:
         self._has_draft_parts = spec.draft_region is not None
         # An MLA latent is replicated, but a fused MHA draft carries rank-local heads.
         self.storage_rank_replicated = spec.draft_region is None or isinstance(
@@ -225,7 +244,7 @@ class MLAView(MLAKVView):
         self.size = self.num_pages * page_size - page_size
         self.page_size = page_size
         self.dtype = kv_cache_dtype
-        self.store_dtype = spec.store_dtype
+        self.store_dtype = store_dtype
         self.device = arena.device
         self.kv_lora_rank = spec.kv_lora_rank
         self.qk_rope_head_dim = spec.qk_rope_head_dim

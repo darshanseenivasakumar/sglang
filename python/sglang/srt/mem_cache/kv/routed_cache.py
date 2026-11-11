@@ -234,3 +234,118 @@ class RoutedKVCache(KVCache):
             "a unified pool's retraction copies go through its allocator, "
             "which maps the ids per sub-pool"
         )
+
+    # -- sparse attention: latent rows by row index, indexer keys per page --
+
+    @property
+    def use_dsa(self) -> bool:
+        return bool(getattr(self._owner_view, "use_dsa", False))
+
+    def _dsa_view(self):
+        view = self._owner_view
+        assert getattr(view, "use_dsa", False), (
+            "the owner's view keeps no sparse-attention storage"
+        )
+        return view
+
+    @property
+    def dsa_kv_cache_store_fp8(self) -> bool:
+        return bool(getattr(self._owner_view, "dsa_kv_cache_store_fp8", False))
+
+    @property
+    def addresses_rows_by_index(self) -> bool:
+        """Whether readers address latent rows by `row_index` of a token id."""
+        return bool(getattr(self._owner_view, "addresses_rows_by_index", False))
+
+    def row_index(self, loc: torch.Tensor) -> torch.Tensor:
+        return self._dsa_view().row_index(loc)
+
+    @property
+    def kv_scale_ue8m0(self) -> bool:
+        return bool(getattr(self._owner_view, "kv_scale_ue8m0", False))
+
+    @property
+    def kv_cache_dim(self):
+        return getattr(self._owner_view, "kv_cache_dim", None)
+
+    @property
+    def index_head_dim(self):
+        return getattr(self._owner_view, "index_head_dim", None)
+
+    @property
+    def quant_block_size(self):
+        return getattr(self._owner_view, "quant_block_size", None)
+
+    @property
+    def index_kpool(self) -> int:
+        return getattr(self._owner_view, "index_kpool", 1)
+
+    @property
+    def index_kpool_compress(self) -> bool:
+        return bool(getattr(self._owner_view, "index_kpool_compress", False))
+
+    @property
+    def tail_extra_slots(self) -> int:
+        return getattr(self._owner_view, "tail_extra_slots", 0)
+
+    @property
+    def index_page_size(self) -> int:
+        return getattr(self._owner_view, "index_page_size", self.page_size)
+
+    @property
+    def use_fp4_indexer(self) -> bool:
+        return bool(getattr(self._owner_view, "use_fp4_indexer", False))
+
+    @property
+    def index_bytes_per_token(self):
+        return getattr(self._owner_view, "index_bytes_per_token", None)
+
+    @property
+    def index_key_bytes_per_token(self):
+        return getattr(self._owner_view, "index_key_bytes_per_token", None)
+
+    def _index_layer(self, layer_id: int, *, wait: bool):
+        route = (
+            self.layer_router.read(layer_id)
+            if wait
+            else self.layer_router.layer(layer_id)
+        )
+        assert getattr(route.view, "use_dsa", False), (
+            f"layer {layer_id} keeps no indexer keys"
+        )
+        return route
+
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        route = self._index_layer(layer_id, wait=True)
+        return route.view.get_index_k_with_scale_buffer(route.view_layer_id)
+
+    def get_broadcastable_index_k_with_scale_buffer(self, layer_id: int):
+        return self.get_index_k_with_scale_buffer(layer_id)
+
+    def invalidate_index_buffer_for_layer(self, layer_id: int) -> None:
+        return None
+
+    def get_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        seq_len_tensor: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+    ):
+        route = self._index_layer(layer_id, wait=True)
+        return route.view.get_index_k_scale_buffer(
+            route.view_layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
+        )
+
+    def set_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        index_k_scale: torch.Tensor,
+    ) -> None:
+        route = self._index_layer(layer_id, wait=False)
+        route.view.set_index_k_scale_buffer(
+            route.view_layer_id, loc, index_k, index_k_scale
+        )

@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.kv.decl import (
     window_sub_pool_name,
 )
 from sglang.srt.mem_cache.kv.layout.base import SubPoolSpec, _store_dtype_for
+from sglang.srt.mem_cache.kv.layout.dsa import DSAMLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.request import RequestSubPoolSpec
@@ -447,11 +448,33 @@ def _spec_for(
     *,
     name: str,
     geometry: PartGeometry,
-    layer_num: int,
+    layer_ids: Tuple[int, ...],
+    page_size: int,
     grow_direction: str,
     fused_draft: Optional[FusedDraftPlacement],
 ) -> SubPoolSpec:
+    layer_num = len(layer_ids)
     draft_region = None if fused_draft is None else fused_draft.region(name)
+    if isinstance(geometry, MLAGeometry) and geometry.dsa is not None:
+        assert draft_region is None, (
+            f"a fused draft cannot ride in sparse-attention sub-pool {name!r}"
+        )
+        dsa = geometry.dsa
+        missing = set(dsa.index_layer_ids) - set(layer_ids)
+        assert not missing, f"indexer layers {sorted(missing)} keep no latent rows"
+        return DSAMLASubPoolSpec(
+            name=name,
+            layer_num=layer_num,
+            kv_lora_rank=geometry.kv_lora_rank,
+            qk_rope_head_dim=geometry.qk_rope_head_dim,
+            row_bytes=dsa.row_bytes,
+            page_size=page_size,
+            index_blob_bytes=page_size * dsa.index_bytes_per_token,
+            index_layers=tuple(
+                i for i, layer in enumerate(layer_ids) if layer in dsa.index_layer_ids
+            ),
+            grow_direction=grow_direction,
+        )
     if isinstance(geometry, MHAGeometry):
         return MHASubPoolSpec(
             name=name,
@@ -568,7 +591,8 @@ def plan_kv_storage(
                 spec=_spec_for(
                     name=name,
                     geometry=geometry,
-                    layer_num=len(layer_ids),
+                    layer_ids=tuple(layer_ids),
+                    page_size=page_size,
                     grow_direction=grow_direction,
                     fused_draft=fused_draft,
                 ),
