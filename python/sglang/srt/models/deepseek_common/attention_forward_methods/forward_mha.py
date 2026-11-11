@@ -694,8 +694,6 @@ class DeepseekMHAForwardMixin:
             kv_indices = torch.arange(
                 kv_indices.shape[0], dtype=kv_indices.dtype, device=kv_indices.device
             )
-        else:
-            kv_indices = backend.latent_kv_rows(kv_indices)
 
         kv_latent_bf16 = dequantize_k_cache_paged_dsa(kv_cache_fp8, kv_indices)
 

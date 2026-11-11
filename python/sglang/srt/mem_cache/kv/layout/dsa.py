@@ -1,19 +1,21 @@
-"""The sparse-attention (DSA) MLA layout: each page holds its tokens' latent rows
-and, after them, every indexer layer's key blob for those tokens.
+"""The sparse-attention (DSA) MLA layout: each page holds its tokens' latent rows,
+layer by layer, then every indexer layer's key blob for those tokens.
 
-One page of ``page_size`` tokens, ``L`` latent layers and ``I`` indexer layers:
+One page of ``P = page_size`` tokens, ``L`` latent layers and ``I`` indexer
+layers:
 
-    [ token 0: row_0 .. row_{L-1} | ... | token P-1: row_0 .. row_{L-1} ]
+    [ layer 0: rows of tokens 0..P-1 ] ... [ layer L-1: rows of tokens 0..P-1 ]
     [ index blob of indexer layer 0 | ... | of indexer layer I-1 ] [ pad ]
 
 A latent row is ``row_bytes`` long (FP8 NoPE with per-block scales, then the
 RoPE tail) and an index blob is the page's keys followed by their scales, as
-the paged index kernels read it. The page is padded to a multiple of
-``row_bytes``, so every latent row of the band sits on a ``row_bytes`` grid
-counted from the arena's first byte: a layer's rows form one flat run of rows,
-and the row of token ``t`` in layer ``l`` is ``row_index(t)`` in layer ``l``'s
-run. Readers and writers that address rows by token take ``row_index`` of the
-token ids; the index blobs are pages ``page_bytes`` apart.
+the paged index kernels read it. A layer's rows are a paged buffer
+``(pages, P, 1, row_bytes)`` whose pages are a whole page entry apart: the row
+of physical token ``t`` sits at page ``t // P``, slot ``t % P``. The paged
+kernels (FlashMLA, the latent writers and gathers) take those strides from the
+buffer, so readers and writers address rows by the token id itself. The page
+is padded to a multiple of ``row_bytes`` and of ``P``, so the page stride stays
+a whole number of rows and of token entries.
 """
 
 import math
@@ -69,63 +71,38 @@ class DSAMLASubPoolSpec(SubPoolSpec):
     def kv_cache_dim(self) -> int:
         return self.row_bytes
 
-    def token_bytes(self) -> int:
-        """Latent bytes of one token over every layer."""
-        return self.layer_num * self.row_bytes
+    def layer_bytes(self) -> int:
+        """One layer's rows of a page."""
+        return self.page_size * self.row_bytes
 
     def index_offset(self) -> int:
         """Byte offset of the first index blob inside a page."""
-        return self.page_size * self.token_bytes()
+        return self.layer_num * self.layer_bytes()
 
     def page_bytes(self) -> int:
-        """One page, padded so that pages keep the latent rows on their grid
-        and split into whole token entries. At least ``page_size - 1`` rows follow
-        the token rows, so that a layer's run of rows, cut to whole blocks of
-        ``page_size`` rows, still reaches the last page's last token."""
-        tail = max(
-            len(self.index_layers) * self.index_blob_bytes,
-            (self.page_size - 1) * self.row_bytes,
-        )
+        """One page, padded to whole rows and whole token entries."""
+        raw = self.index_offset() + len(self.index_layers) * self.index_blob_bytes
         grid = math.lcm(self.row_bytes, self.page_size)
-        return -(-(self.index_offset() + tail) // grid) * grid
+        return -(-raw // grid) * grid
 
     def entry_bytes(self) -> int:
         # The arena counts a band in token entries; a page is `page_size` of them.
         return self.page_bytes() // self.page_size
 
-    def rows_per_page(self) -> int:
-        return self.page_bytes() // self.row_bytes
-
-    def row_index(self, loc: torch.Tensor) -> torch.Tensor:
-        """The row of each token id in a layer's run of rows; -1 stays -1."""
-        page, slot = loc // self.page_size, loc % self.page_size
-        rows = page * self.rows_per_page() + slot * self.layer_num
-        return torch.where(loc < 0, loc, rows)
-
     def views(self, arena) -> List[torch.Tensor]:
-        """Per-layer runs of latent rows, ``(rows, 1, row_bytes)`` bytes. Each run
-        holds a whole number of ``page_size`` rows, as paged readers view it, and
-        still reaches every token's row."""
+        """Per layer, its rows as a paged ``(pages, page_size, 1, row_bytes)``
+        byte buffer: page ``p`` is page ``p`` of the band, ``page_bytes`` apart."""
         pages = dense_rows(arena, self.name) // self.page_size
-        rows = pages * self.rows_per_page()
-        check_physical_id_bound(sub_pool=self.name, n_rows=rows)
-        # The last token's row of the last page, in the last layer's run.
-        last = (pages - 1) * self.rows_per_page() + (
-            self.page_size - 1
-        ) * self.layer_num
-        runs = []
-        for layer in range(self.layer_num):
-            run = (rows - layer) // self.page_size * self.page_size
-            assert run > last, "a paged run of rows must reach every token"
-            runs.append(
-                torch.as_strided(
-                    arena.raw,
-                    (run, 1, self.row_bytes),
-                    (self.row_bytes, self.row_bytes, 1),
-                    layer * self.row_bytes,
-                )
+        check_physical_id_bound(sub_pool=self.name, n_rows=pages * self.page_size)
+        return [
+            torch.as_strided(
+                arena.raw,
+                (pages, self.page_size, 1, self.row_bytes),
+                (self.page_bytes(), self.row_bytes, self.row_bytes, 1),
+                layer * self.layer_bytes(),
             )
-        return runs
+            for layer in range(self.layer_num)
+        ]
 
     def index_views(self, arena) -> List[torch.Tensor]:
         """Per indexer layer, its blobs as ``(pages, blob)`` bytes, one row per
@@ -149,8 +126,8 @@ class DSAMLAView(MLAView):
     """The latent rows and indexer keys of a sparse-attention MLA sub-pool.
 
     Latent rows are FP8 with per-block scales, quantized on write. Per-layer
-    buffers are runs of rows addressed by ``row_index`` of the physical token
-    id, not by the id itself.
+    buffers are paged ``(pages, page_size, 1, row_bytes)`` views addressed by
+    the physical token id through their page and row strides.
     """
 
     use_dsa = True
@@ -159,8 +136,6 @@ class DSAMLAView(MLAView):
     index_kpool = 1
     index_kpool_compress = False
     tail_extra_slots = 0
-    # Readers address this view's rows through `row_index`.
-    addresses_rows_by_index = True
 
     def __init__(
         self,
@@ -180,7 +155,6 @@ class DSAMLAView(MLAView):
             "sparse-attention latent rows are stored as FP8 with block scales"
         )
         assert spec.page_size == page_size
-        self._dsa_spec = spec
         self._init_view(
             arena=arena,
             spec=spec,
@@ -203,9 +177,6 @@ class DSAMLAView(MLAView):
         self._index_buffer = [None] * spec.layer_num
         for i, layer in enumerate(spec.index_layers):
             self._index_buffer[layer] = index_views[i]
-
-    def row_index(self, loc: torch.Tensor) -> torch.Tensor:
-        return self._dsa_spec.row_index(loc)
 
     # -- latent rows --
 
@@ -248,9 +219,7 @@ class DSAMLAView(MLAView):
         nope, rope = quantize_k_cache_separate(
             cache_k_nope, cache_k_rope, scale_ue8m0=self.kv_scale_ue8m0
         )
-        set_mla_kv_buffer_triton(
-            self.kv_buffer[layer_id], self.row_index(loc), nope, rope
-        )
+        set_mla_kv_buffer_triton(self.kv_buffer[layer_id], loc, nope, rope)
 
     # -- indexer keys --
 

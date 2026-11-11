@@ -235,30 +235,15 @@ class RoutedKVCache(KVCache):
             "which maps the ids per sub-pool"
         )
 
-    # -- sparse attention: latent rows by row index, indexer keys per page --
+    # -- sparse attention: latent rows and indexer keys per page --
 
     @property
     def use_dsa(self) -> bool:
         return bool(getattr(self._owner_view, "use_dsa", False))
 
-    def _dsa_view(self):
-        view = self._owner_view
-        assert getattr(view, "use_dsa", False), (
-            "the owner's view keeps no sparse-attention storage"
-        )
-        return view
-
     @property
     def dsa_kv_cache_store_fp8(self) -> bool:
         return bool(getattr(self._owner_view, "dsa_kv_cache_store_fp8", False))
-
-    @property
-    def addresses_rows_by_index(self) -> bool:
-        """Whether readers address latent rows by `row_index` of a token id."""
-        return bool(getattr(self._owner_view, "addresses_rows_by_index", False))
-
-    def row_index(self, loc: torch.Tensor) -> torch.Tensor:
-        return self._dsa_view().row_index(loc)
 
     @property
     def kv_scale_ue8m0(self) -> bool:

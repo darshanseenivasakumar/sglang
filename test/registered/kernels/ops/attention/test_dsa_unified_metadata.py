@@ -1,15 +1,12 @@
-"""DSA metadata and latent-row reads on the unified memory pool, on GPU.
+"""DSA page-table metadata on the unified memory pool, on GPU.
 
-`req_to_token` holds virtual token ids there. The fused metadata builders
-translate them through the full sub-pool's virtual->physical page table as
-they fill the page tables:
+`req_to_token` holds virtual token ids there. The fused metadata builders, and
+the eager path's gather, translate them through the full sub-pool's
+virtual->physical page table as they fill the page tables:
 
     physical(t) = v2p[t // 64] * 64 + t % 64
 
-and the pool keeps a token's latent row at `row_index` of its physical id, a
-run of rows interleaving each page's layers. FlashMLA's sparse decode and the
-prefix dequant gather read those rows exactly as a static pool's rows of the
-same tokens.
+in the same launches a static pool's metadata takes.
 """
 
 import unittest
@@ -17,25 +14,20 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
-    dequantize_k_cache_paged_dsa,
-)
 from sglang.kernels.ops.attention.dsa.metadata import (
     fused_dsa_decode_metadata,
     fused_dsa_draft_extend_metadata,
     fused_dsa_target_verify_metadata,
+    gather_physical_token_table,
 )
-from sglang.kernels.ops.kvcache.mla_buffer import set_mla_kv_buffer_triton
-from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache_separate
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
-from sglang.srt.mem_cache.kv.layout.dsa import DSAMLASubPoolSpec
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 PAGE = 64
 REQ_ROWS, WIDTH = 8, 4096
@@ -320,123 +312,24 @@ class TestDecodeGraphReplayTranslates(CustomTestCase):
                 v2p.copy_(_virtual_pool(3)[1])
 
 
-def _k31_rows(pages, layer_num=8):
-    """A layer-interleaved run of 656-byte latent rows per layer, as the
-    unified pool lays out a sparse-attention sub-pool."""
-    spec = DSAMLASubPoolSpec(
-        name="full",
-        layer_num=layer_num,
-        grow_direction="down",
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        row_bytes=656,
-        page_size=PAGE,
-        index_blob_bytes=PAGE * 132,
-        index_layers=tuple(range(layer_num)),
-    )
-    raw = torch.zeros(pages * spec.page_bytes(), dtype=torch.uint8, device="cuda")
-    arena = SimpleNamespace(
-        raw=raw,
-        band=lambda name: SimpleNamespace(unit_entries=PAGE),
-        extent_entries=lambda name: pages * PAGE,
-    )
-    return spec, spec.views(arena)
+class TestEagerGatherTranslates(CustomTestCase):
+    def test_gather_matches_the_reference(self):
+        req_to_token, v2p = _virtual_pool(4)
+        req = torch.tensor([7, 0, 3], device="cuda")
+        for width in (1, 64, 1000, WIDTH, WIDTH + 100):
+            with self.subTest(width=width):
+                table = gather_physical_token_table(req_to_token, req, width, v2p, PAGE)
+                self.assertEqual(table.dtype, torch.int32)
+                expected = _physical(req_to_token[req, :width], v2p)
+                torch.testing.assert_close(table, expected, rtol=0, atol=0)
 
-
-def _flashmla_backend(pool):
-    backend = object.__new__(DeepseekSparseAttnBackend)
-    backend.__dict__.update(
-        token_to_kv_pool=pool,
-        flashmla_kv_num_q_heads=64,
-        dsa_shards_index_k=False,
-        physical_page_size=PAGE,
-        kv_cache_dim=656,
-        dsa_kv_cache_store_fp8=True,
-        dsa_index_topk=TOPK,
-        flashmla_kv_format="V32",
-    )
-    return backend
-
-
-@unittest.skipUnless(
-    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] in (9, 10),
-    "FlashMLA sparse decode needs SM90 or SM100",
-)
-class TestLatentRowsByIndex(CustomTestCase):
-    def setUp(self):
-        torch.manual_seed(0)
-        self.pages = 6
-        self.spec, self.runs = _k31_rows(self.pages)
-        # Physical token ids past the sink page, in no particular order.
-        self.ids = (torch.randperm((self.pages - 1) * PAGE, device="cuda") + PAGE)[
-            :300
-        ].to(torch.int32)
-        self.static = torch.zeros(
-            self.pages * PAGE, 1, 656, dtype=torch.uint8, device="cuda"
+    def test_unmapped_pages_read_the_sink(self):
+        req_to_token, v2p = _virtual_pool(5)
+        v2p[int(req_to_token[2, 70]) // PAGE] = -1
+        table = gather_physical_token_table(
+            req_to_token, torch.tensor([2], device="cuda"), 192, v2p, PAGE
         )
-        # Every layer holds distinct latents, so a wrong row reads other data.
-        self.layer = 5
-        for layer, run in enumerate(self.runs):
-            nope = torch.randn(300, 512, dtype=torch.bfloat16, device="cuda")
-            rope = torch.randn(300, 64, dtype=torch.bfloat16, device="cuda")
-            nope_q, rope_q = quantize_k_cache_separate(nope, rope, scale_ue8m0=True)
-            set_mla_kv_buffer_triton(run, self.spec.row_index(self.ids), nope_q, rope_q)
-            if layer == self.layer:
-                set_mla_kv_buffer_triton(self.static, self.ids, nope_q, rope_q)
-        self.row_pool = SimpleNamespace(
-            addresses_rows_by_index=True, row_index=self.spec.row_index
-        )
-        self.static_pool = SimpleNamespace(addresses_rows_by_index=False)
-
-    def _decode(self, pool, kv_cache, q, indices, lengths):
-        backend = _flashmla_backend(pool)
-        metadata = SimpleNamespace(
-            dsa_cache_seqlens_int32=lengths,
-            flashmla_metadata=backend._compute_flashmla_metadata(
-                cache_seqlens=lengths, seq_len_q=1
-            ),
-        )
-        return backend._forward_flashmla_kv(
-            q_all=q,
-            kv_cache=kv_cache.view(torch.float8_e4m3fn),
-            v_head_dim=512,
-            sm_scale=576**-0.5,
-            layer=SimpleNamespace(tp_q_head_num=64, head_dim=576),
-            metadata=metadata,
-            page_table_1=indices,
-            forward_batch=SimpleNamespace(),
-        )
-
-    def test_flashmla_kv_decode_matches_static_rows(self):
-        rows = 4
-        q = torch.randn(rows, 64, 576, dtype=torch.bfloat16, device="cuda") / 4
-        lengths = torch.tensor([300, 17, 150, 1], dtype=torch.int32, device="cuda")
-        indices = torch.full((rows, TOPK), -1, dtype=torch.int32, device="cuda")
-        for row, length in enumerate(lengths.tolist()):
-            pick = torch.randperm(300, device="cuda")[:length]
-            indices[row, :length] = self.ids[pick]
-        expected = self._decode(self.static_pool, self.static, q, indices, lengths)
-        actual = self._decode(self.row_pool, self.runs[self.layer], q, indices, lengths)
-        self.assertTrue(torch.isfinite(expected).all())
-        self.assertGreater(expected.abs().sum().item(), 0)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        # Reading the run by token id instead lands on other tokens' rows.
-        wrong = self._decode(
-            self.static_pool, self.runs[self.layer], q, indices, lengths
-        )
-        self.assertFalse(torch.equal(wrong, expected))
-
-    def test_prefix_dequant_matches_static_rows(self):
-        flat = self.ids[torch.randperm(300, device="cuda")[:200]]
-        backend = _flashmla_backend(self.row_pool)
-        actual = dequantize_k_cache_paged_dsa(
-            self.runs[self.layer].view(torch.float8_e4m3fn),
-            backend.latent_kv_rows(flat),
-        )
-        expected = dequantize_k_cache_paged_dsa(
-            self.static.view(torch.float8_e4m3fn), flat
-        )
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertEqual(table[0, 64:128].tolist(), [0] * 64)
 
 
 if __name__ == "__main__":

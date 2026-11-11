@@ -1,6 +1,7 @@
 """The sparse-attention page layout of the unified pool: each page holds its
-tokens' latent rows, then one indexer key blob per indexer layer, padded so
-that latent rows keep a grid of their own width across pages."""
+tokens' latent rows layer by layer, then one indexer key blob per indexer layer,
+padded to whole rows and whole token entries. A layer's rows are a paged buffer
+whose pages lie a page entry apart."""
 
 import unittest
 from types import SimpleNamespace
@@ -47,8 +48,9 @@ def _spec(**overrides):
 
 class TestPageArithmetic(CustomTestCase):
     def test_kimi_k31_page(self):
-        """24 layers of 656-byte FP8 rows and an 8448-byte index blob per layer
-        fill 1,210,368 bytes; the page rounds up to 1848 rows of 656 bytes."""
+        """24 layers of 64 656-byte FP8 rows and an 8448-byte index blob per
+        layer fill 1,210,368 bytes; the page rounds up to 1848 rows of 656
+        bytes, a whole number of 64-token entries."""
         spec = _spec(
             layer_num=24,
             row_bytes=656,
@@ -56,43 +58,45 @@ class TestPageArithmetic(CustomTestCase):
             index_blob_bytes=64 * 132,
             index_layers=tuple(range(24)),
         )
-        self.assertEqual(spec.token_bytes(), 24 * 656)
+        self.assertEqual(spec.layer_bytes(), 64 * 656)
+        self.assertEqual(spec.index_offset(), 24 * 64 * 656)
         self.assertEqual(spec.page_bytes(), 1_212_288)
-        self.assertEqual(spec.rows_per_page(), 1848)
+        self.assertEqual(spec.page_bytes() % 656, 0)
         self.assertEqual(spec.entry_bytes() * 64, spec.page_bytes())
 
-    def test_row_index_follows_pages(self):
-        spec = _spec()
-        # 4 tokens x 96 bytes of rows + 2 blobs of 48 bytes = 480 = 15 rows.
-        self.assertEqual(spec.page_bytes(), 480)
-        loc = torch.tensor([0, 1, 3, 4, 9, -1])
-        self.assertEqual(spec.row_index(loc).tolist(), [0, 3, 9, 15, 33, -1])
-
-    def test_runs_reach_every_token_with_few_layers(self):
-        """With two latent layers the index blobs alone leave fewer than 63 rows
-        after the token rows; the page is padded so that every layer's run, cut
-        to whole 64-row blocks, still reaches the last page's last token."""
-        spec = _spec(
-            layer_num=2,
-            row_bytes=656,
-            page_size=64,
-            index_blob_bytes=64 * 132,
-            index_layers=(0, 1),
-        )
-        rows = spec.rows_per_page()
-        self.assertGreaterEqual(rows - 64 * 2, 63)
-        for pages in range(1, 40):
-            last = int(spec.row_index(torch.tensor([pages * 64 - 1])))
-            for layer in range(2):
-                run = (pages * rows - layer) // 64 * 64
-                self.assertLess(last, run, (pages, layer))
-
-    def test_pages_are_padded_to_the_row_grid(self):
+    def test_pages_are_padded_to_whole_rows_and_entries(self):
         spec = _spec(index_layers=(0,))
         self.assertEqual(spec.page_bytes() % _ROW, 0)
+        self.assertEqual(spec.page_bytes() % _PAGE, 0)
         self.assertGreaterEqual(
             spec.page_bytes(), spec.index_offset() + spec.index_blob_bytes
         )
+
+    def test_layer_views_are_paged(self):
+        """Layer l's buffer is (pages, page_size, 1, row): token t's row is at
+        page t // page_size, slot t % page_size, inside layer l's block of the
+        page entry."""
+        spec = _spec()
+        pages = 5
+        arena = SimpleNamespace(
+            raw=torch.zeros(pages * spec.page_bytes(), dtype=torch.uint8),
+            band=lambda name: SimpleNamespace(unit_entries=_PAGE),
+            extent_entries=lambda name: pages * _PAGE,
+        )
+        views = spec.views(arena)
+        self.assertEqual(len(views), spec.layer_num)
+        for layer, view in enumerate(views):
+            self.assertEqual(tuple(view.shape), (pages, _PAGE, 1, _ROW))
+            self.assertEqual(view.stride(), (spec.page_bytes(), _ROW, _ROW, 1))
+            for token in (0, 1, 5, 4 * _PAGE + 3):
+                row = view[token // _PAGE, token % _PAGE, 0]
+                offset = row.data_ptr() - arena.raw.data_ptr()
+                self.assertEqual(
+                    offset,
+                    token // _PAGE * spec.page_bytes()
+                    + layer * spec.layer_bytes()
+                    + token % _PAGE * _ROW,
+                )
 
 
 class TestViewsOverTheArena(CustomTestCase):
@@ -178,12 +182,10 @@ class TestViewsOverTheArena(CustomTestCase):
         expected = {}
         for page in pages:
             for slot in range(_PAGE):
-                loc = torch.tensor([page * _PAGE + slot])
-                row = int(view.row_index(loc))
                 for layer in range(spec.layer_num):
-                    view.kv_buffer[layer][row] = stamp
-                    start = page * spec.page_bytes() + slot * spec.token_bytes()
-                    start += layer * _ROW
+                    view.kv_buffer[layer][page, slot] = stamp
+                    start = page * spec.page_bytes() + layer * spec.layer_bytes()
+                    start += slot * _ROW
                     expected[stamp] = range(start, start + _ROW)
                     stamp += 1
             for layer in spec.index_layers:

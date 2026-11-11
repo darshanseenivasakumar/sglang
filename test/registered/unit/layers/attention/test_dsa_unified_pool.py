@@ -1,11 +1,11 @@
 """DSA attention on the unified memory pool, on CPU.
 
 `req_to_token` holds virtual token ids there, which the backend's page tables
-translate once into the physical ids of the full sub-pool: the indexer, the
-top-k transforms and attention then all read physical ids. The pool keeps a
-token's latent row at `row_index` of its physical id (each page interleaves its
-tokens' rows across layers), so every reader of latent rows by token id takes
-the mapped rows. A static pool keeps both maps the identity.
+translate once, as they gather them, into the physical ids of the full
+sub-pool: the indexer, the top-k transforms and attention then all read
+physical ids. A layer's latent rows are a paged buffer the kernels address by
+the physical token id itself; the backend hands them its writes' ids marked
+physical. A static pool keeps the ids as `req_to_token` holds them.
 """
 
 import unittest
@@ -16,7 +16,6 @@ import torch
 
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
-    TopkTransformMethod,
 )
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
@@ -25,8 +24,8 @@ from sglang.srt.layers.attention.dsa_backend import (
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.layout.dsa import DSAMLASubPoolSpec
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, write_loc_is_physical
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mha
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import setup_allocator_context
@@ -75,9 +74,9 @@ def _routed(pool):
     return pool
 
 
-def _row_indexed_pool(get_key_buffer=None):
-    """The unified pool's sparse-attention view: K3.1's 656-byte rows of 24
-    layers in 64-token pages."""
+def _k31_layer_rows(pages=3):
+    """One layer's paged latent rows as the unified pool lays K3.1 out: 64
+    656-byte rows per page, pages a 1,212,288-byte entry apart."""
     spec = DSAMLASubPoolSpec(
         name="full",
         layer_num=24,
@@ -89,19 +88,12 @@ def _row_indexed_pool(get_key_buffer=None):
         index_blob_bytes=64 * 132,
         index_layers=tuple(range(24)),
     )
-    return _routed(
-        SimpleNamespace(
-            addresses_rows_by_index=True,
-            row_index=spec.row_index,
-            get_key_buffer=get_key_buffer,
-        )
-    ), spec
-
-
-def _static_pool(get_key_buffer=None):
-    return _routed(
-        SimpleNamespace(addresses_rows_by_index=False, get_key_buffer=get_key_buffer)
+    arena = SimpleNamespace(
+        raw=torch.zeros(pages * spec.page_bytes(), dtype=torch.uint8),
+        band=lambda name: SimpleNamespace(unit_entries=64),
+        extent_entries=lambda name: pages * 64,
     )
+    return spec.views(arena)[5]
 
 
 def _metadata_backend(req_to_token, runner_ids):
@@ -231,28 +223,80 @@ class TestPhysicalPageTables(CustomTestCase):
         backend = _metadata_backend(req_to_token, _runner_ids(v2p))
         dropped = int(req_to_token[1, 0]) // PAGE
         v2p[dropped] = -1
-        table = backend._physical_token_table(req_to_token[1:2, :PAGE])
+        table = backend._gather_token_table(req_to_token, torch.tensor([1]), PAGE)
         self.assertEqual(table.tolist(), [[0] * PAGE])
 
 
-class TestLatentRowsByIndex(CustomTestCase):
-    def _backend(self, pool):
+class _Written(Exception):
+    """Stops a forward once its latent write has been seen."""
+
+
+class TestLatentWrites(CustomTestCase):
+    """The backend hands its latent writes the batch's write ids under the
+    batch's physical mark: the unified pool's views refuse unmarked ids."""
+
+    def _backend(self, seen):
+        def store(layer, loc_info, k, k_rope):
+            seen.append(loc_info)
+            raise _Written
+
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
-        backend.token_to_kv_pool = pool
+        backend.__dict__.update(
+            token_to_kv_pool=_routed(SimpleNamespace(set_mla_kv_buffer=store)),
+            dsa_prefill_impl="flashmla_kv",
+            dsa_decode_impl="flashmla_kv",
+            use_mha=False,
+            forward_metadata=None,
+            _resolve_kpool_tail_backend=lambda indices, impl: impl,
+            _check_kpool_tail_backend=lambda *args: None,
+        )
         return backend
 
-    def test_flashmla_kv_indexes_rows(self):
-        """FlashMLA reads row `i` of the layer's rows for index `i`: on the
-        unified pool that is `row_index` of the top-k's token ids, -1 kept."""
-        topk = torch.tensor([[0, 65, 130, -1], [3, 64, -1, -1]], dtype=torch.int32)
-        pool, spec = _row_indexed_pool()
-        expected = spec.row_index(topk)
-        self.assertEqual(expected[0, 1].item(), 1848 + 24)
-        self.assertTrue(torch.equal(self._indices(pool, topk), expected))
-        self.assertTrue(torch.equal(self._indices(_static_pool(), topk), topk))
+    def _write_loc(self, forward, mode, physical):
+        seen = []
+        backend = self._backend(seen)
+        loc = torch.tensor([64, 65, 130])
+        batch = SimpleNamespace(
+            forward_mode=mode,
+            out_cache_loc=loc,
+            out_cache_loc_is_physical=physical,
+        )
+        layer = SimpleNamespace(layer_id=0, is_cross_attention=False)
+        with self.assertRaises(_Written):
+            getattr(backend, forward)(
+                q=torch.zeros(3, 8),
+                k=torch.zeros(3, 1, 512),
+                v=torch.zeros(3, 1, 512),
+                layer=layer,
+                forward_batch=batch,
+                save_kv_cache=True,
+                k_rope=torch.zeros(3, 1, 64),
+            )
+        (loc_info,) = seen
+        self.assertIsInstance(loc_info, KVWriteLoc)
+        self.assertIs(loc_info.loc, loc)
+        return loc_info
 
-    def _indices(self, pool, topk):
-        backend = self._backend(pool)
+    def test_writes_carry_the_physical_mark(self):
+        for forward, mode in (
+            ("forward_extend", ForwardMode.EXTEND),
+            ("forward_decode", ForwardMode.DECODE),
+        ):
+            with self.subTest(forward=forward):
+                loc_info = self._write_loc(forward, mode, physical=True)
+                self.assertTrue(write_loc_is_physical(loc_info))
+
+    def test_static_writes_stay_unmarked(self):
+        loc_info = self._write_loc("forward_decode", ForwardMode.DECODE, False)
+        self.assertFalse(write_loc_is_physical(loc_info))
+
+
+class TestFlashMLAReadsPagedRows(CustomTestCase):
+    def test_indices_are_token_ids_and_the_cache_keeps_its_pages(self):
+        """FlashMLA takes the layer's paged rows as they are, with the top-k's
+        physical token ids: no remapping per layer."""
+        rows = _k31_layer_rows()
+        topk = torch.tensor([[0, 65, 130, -1], [3, 64, -1, -1]], dtype=torch.int32)
         seen = {}
 
         def fake_flash_mla(**kwargs):
@@ -260,6 +304,7 @@ class TestLatentRowsByIndex(CustomTestCase):
             q = kwargs["q"]
             return q.new_zeros(*q.shape[:3], 512), q.new_zeros(q.shape[0], 1)
 
+        backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
         backend.__dict__.update(
             flashmla_kv_num_q_heads=2,
             dsa_shards_index_k=False,
@@ -270,15 +315,14 @@ class TestLatentRowsByIndex(CustomTestCase):
             flashmla_kv_format="V32",
             _call_flash_mla_with_kvcache=fake_flash_mla,
         )
-        rows = topk.shape[0]
         backend._forward_flashmla_kv(
-            q_all=torch.zeros(rows, 2, 576),
-            kv_cache=torch.zeros(2 * 64, 1, 656, dtype=torch.uint8),
+            q_all=torch.zeros(2, 2, 576),
+            kv_cache=rows,
             v_head_dim=512,
             sm_scale=1.0,
             layer=SimpleNamespace(tp_q_head_num=2, head_dim=576),
             metadata=SimpleNamespace(
-                dsa_cache_seqlens_int32=torch.full((rows,), 4, dtype=torch.int32),
+                dsa_cache_seqlens_int32=torch.full((2,), 4, dtype=torch.int32),
                 flashmla_metadata=SimpleNamespace(
                     flashmla_metadata=None, num_splits=None
                 ),
@@ -286,115 +330,42 @@ class TestLatentRowsByIndex(CustomTestCase):
             page_table_1=topk,
             forward_batch=SimpleNamespace(),
         )
-        return seen["indices"].squeeze(1)
+        self.assertTrue(torch.equal(seen["indices"].squeeze(1), topk))
+        k_cache = seen["k_cache"]
+        self.assertEqual(k_cache.data_ptr(), rows.data_ptr())
+        self.assertEqual(k_cache.stride(), (1_212_288, 656, 656, 1))
 
-    def test_ragged_prefix_dequant_indexes_rows(self):
-        """A prefix-sharing RAGGED prefill dequantizes the batch's latent rows
-        through the prefix gather, which takes their rows."""
-        flat = torch.tensor([64, 65, 66, 200, 201], dtype=torch.int32)
-        pool, spec = _row_indexed_pool(lambda _: torch.zeros(4 * 64, 1, 656))
-        self.assertTrue(
-            torch.equal(self._dequant_rows(pool, flat), spec.row_index(flat))
-        )
-        static = _static_pool(lambda _: torch.zeros(4 * 64, 1, 656))
-        self.assertTrue(torch.equal(self._dequant_rows(static, flat), flat))
 
-    def _dequant_rows(self, pool, flat):
-        backend = self._backend(pool)
-        seen = []
-        tokens = 3
-        backend.__dict__.update(
-            dsa_prefill_impl="flashmla_sparse",
-            dsa_shards_index_k=False,
-            use_mha=False,
-            use_fused_topk=True,
-            hisparse_coordinator=None,
-            forward_metadata=SimpleNamespace(
-                page_table_1_flattened=flat,
-                dsa_cache_seqlens_int32=torch.full((tokens,), 2, dtype=torch.int32),
-            ),
-            _resolve_kpool_tail_backend=lambda indices, impl: impl,
-            _check_kpool_tail_backend=lambda *args: None,
-            get_topk_transform_method=lambda _: TopkTransformMethod.RAGGED,
-            _pad_topk_indices=lambda indices, n: indices[:n],
-            _get_fused_topk_page_table=lambda indices: indices,
-            _forward_flashmla_sparse=lambda **kwargs: kwargs["q_all"],
-        )
+class TestTorchWriterPagedRows(CustomTestCase):
+    def test_paged_rows_match_flat_rows(self):
+        """The torch-native writer (platforms without Triton) addresses a paged
+        buffer's rows as the kernels do, and a flat run as it always did."""
+        from sglang.kernels.ops.kvcache.mla_buffer import set_mla_kv_buffer_naive
 
-        def fake_dequant(kv_cache, rows):
-            seen.append(rows)
-            return torch.zeros(rows.shape[0], 1, 576)
-
-        layer = SimpleNamespace(
-            layer_id=0,
-            is_cross_attention=False,
-            tp_q_head_num=2,
-            v_head_dim=512,
-            head_dim=576,
-            scaling=1.0,
-        )
-        with (
-            patch(
-                "sglang.srt.layers.attention.dsa_backend.dequantize_k_cache_paged_dsa",
-                side_effect=fake_dequant,
-            ),
-            patch(
-                "sglang.srt.layers.attention.dsa_backend.concat_mla_absorb_q_general",
-                side_effect=lambda q, rope: torch.cat((q, rope), dim=-1),
-            ),
-        ):
-            backend.forward_extend(
-                q=torch.zeros(tokens, 2 * 512),
-                k=torch.zeros(tokens, 1, 512),
-                v=torch.zeros(tokens, 1, 512),
-                layer=layer,
-                forward_batch=SimpleNamespace(
-                    forward_mode=ForwardMode.EXTEND, extend_prefix_lens_cpu=[2]
-                ),
-                save_kv_cache=False,
-                q_rope=torch.zeros(tokens, 2, 64),
-                k_rope=torch.zeros(tokens, 1, 64),
-                topk_indices=torch.zeros(tokens, 2, dtype=torch.int32),
+        rows = _k31_layer_rows()
+        flat = torch.zeros(3 * 64, 1, 656, dtype=torch.uint8)
+        loc = torch.tensor([0, 65, 130, 7])
+        nope = torch.randint(1, 255, (4, 1, 528), dtype=torch.uint8)
+        rope = torch.randint(1, 255, (4, 1, 128), dtype=torch.uint8)
+        for buf in (rows, flat):
+            set_mla_kv_buffer_naive(
+                buf,
+                loc,
+                nope,
+                rope,
+                reserved_skip_index=0,
+                dcp_world_size=1,
+                dcp_rank=0,
             )
-        self.assertEqual(len(seen), 1)
-        return seen[0]
-
-    def test_mha_prefix_dequant_indexes_rows(self):
-        """MHA one-shot dequantizes the prefix through the same gather."""
-        flat = torch.tensor([1, 64, 129], dtype=torch.int32)
-        pool, spec = _row_indexed_pool()
-        self.assertTrue(torch.equal(self._mha_rows(pool, flat), spec.row_index(flat)))
-        self.assertTrue(torch.equal(self._mha_rows(_static_pool(), flat), flat))
-
-    def _mha_rows(self, pool, flat):
-        backend = self._backend(pool)
-        backend.forward_metadata = SimpleNamespace(page_table_1_flattened=flat)
-        seen = []
-
-        def fake_dequant(kv_cache, rows):
-            seen.append(rows)
-            return torch.zeros(rows.shape[0], 1, 576)
-
-        layers = SimpleNamespace(read=lambda _: SimpleNamespace(key=lambda: None))
-        attn = SimpleNamespace(attn_mha=SimpleNamespace(layer_id=0), kv_lora_rank=512)
-        with (
-            patch.object(forward_mha, "resolve_attn_backend", return_value=backend),
-            patch.object(forward_mha, "get_kv_layers", return_value=layers),
-            patch.object(forward_mha, "dsa_shards_index_k", return_value=False),
-            patch.object(
-                forward_mha, "dequantize_k_cache_paged_dsa", side_effect=fake_dequant
-            ),
-        ):
-            forward_mha.DeepseekMHAForwardMixin._get_mla_kv_buffer_from_fp8_for_dsa(
-                attn, SimpleNamespace()
-            )
-        self.assertEqual(len(seen), 1)
-        return seen[0]
+        packed = torch.cat([nope, rope], dim=-1)
+        self.assertTrue(torch.equal(flat[loc[1:]], packed[1:]))
+        self.assertEqual(int(flat[0].count_nonzero()), 0)
+        paged = rows[loc // 64, loc % 64]
+        self.assertTrue(torch.equal(paged, flat[loc]))
 
 
 class TestUnifiedPoolRefusals(CustomTestCase):
     SERVED = dict(
-        rows_by_index=True,
         translates_ids=True,
         prefill_impl="flashmla_kv",
         decode_impl="flashmla_kv",
@@ -414,7 +385,6 @@ class TestUnifiedPoolRefusals(CustomTestCase):
         _validate_unified_pool_backend(
             **{
                 **self.SERVED,
-                "rows_by_index": False,
                 "translates_ids": False,
                 "decode_impl": "trtllm",
                 "prefill_impl": "trtllm",

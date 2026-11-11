@@ -1950,9 +1950,6 @@ class KVCache(abc.ABC):
     # A draft pool whose rows are the target's sliding-window ids
     # (SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV), not its full-attention ids.
     follows_target_swa_ids: bool = False
-    # Whether a reader finds a token's latent row at `row_index(token_id)` of
-    # the layer's buffer rather than at the token id itself.
-    addresses_rows_by_index: bool = False
 
     @abc.abstractmethod
     def __init__(

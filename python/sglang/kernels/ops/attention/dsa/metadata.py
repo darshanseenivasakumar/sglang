@@ -787,3 +787,66 @@ def fused_dsa_draft_extend_metadata(
         BLOCK_ROWS=block_rows,
         BLOCK_N=block_n,
     )
+
+
+@triton.jit
+def _gather_physical_token_table_kernel(
+    req_to_token,
+    req_pool_indices,
+    v2p,
+    out,
+    num_v_pages,
+    req_to_token_stride_0,
+    out_stride_0,
+    width,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < width
+    req = tl.load(req_pool_indices + row).to(tl.int64)
+    vals = tl.load(
+        req_to_token + req * req_to_token_stride_0 + offs, mask=mask, other=0
+    )
+    ids = _physical_token_ids(vals, v2p, num_v_pages, PAGE_SIZE)
+    tl.store(out + row.to(tl.int64) * out_stride_0 + offs, ids, mask=mask)
+
+
+def gather_physical_token_table(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    width: int,
+    v2p: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    """``req_to_token[req_pool_indices, :width]`` with each id mapped through
+    the virtual->physical page table ``v2p`` (`_physical_token_ids`), as int32,
+    in one launch: the gather a static pool's eager metadata does, translated."""
+    width = min(int(width), req_to_token.shape[1])
+    bs = req_pool_indices.shape[0]
+    if not req_to_token.is_cuda:
+        from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
+
+        return translate_token_ids(
+            loc=req_to_token[req_pool_indices, :width], v2p=v2p, page_size=page_size
+        ).to(torch.int32)
+    assert req_to_token.stride(1) == 1
+    out = torch.empty((bs, width), dtype=torch.int32, device=req_to_token.device)
+    if bs == 0 or width == 0:
+        return out
+    v2p, num_v_pages, _ = _v2p_args(v2p, req_to_token)
+    block = 1024
+    _gather_physical_token_table_kernel[(bs, triton.cdiv(width, block))](
+        req_to_token,
+        req_pool_indices,
+        v2p,
+        out,
+        num_v_pages,
+        req_to_token.stride(0),
+        out.stride(0),
+        width,
+        PAGE_SIZE=page_size,
+        BLOCK=block,
+    )
+    return out
