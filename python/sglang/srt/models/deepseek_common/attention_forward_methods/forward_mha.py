@@ -672,11 +672,9 @@ class DeepseekMHAForwardMixin:
             # reads cached prefix KV crashes with "576 != 656".
             kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             # Read door: the pool never translates, so the production site does.
-            # Only the FlashAttention/FlashInfer backends bind a `RunnerIds`; the
-            # base class documents its None default as "no translate", and the DSA
-            # backend the EAGLE draft model runs on keeps that default. With no
-            # `RunnerIds` the ids never went VIRTUAL, so there is nothing to
-            # collapse.
+            # The base class documents a None `RunnerIds` as "no translate": a
+            # backend without one never made the ids VIRTUAL, so there is
+            # nothing to collapse.
             runner_ids = get_attn_backend().runner_ids
             if runner_ids is not None:
                 kv_indices = runner_ids.translate_dcp_read_ids(kv_indices)
@@ -696,6 +694,8 @@ class DeepseekMHAForwardMixin:
             kv_indices = torch.arange(
                 kv_indices.shape[0], dtype=kv_indices.dtype, device=kv_indices.device
             )
+        else:
+            kv_indices = backend.latent_kv_rows(kv_indices)
 
         kv_latent_bf16 = dequantize_k_cache_paged_dsa(kv_cache_fp8, kv_indices)
 

@@ -50,6 +50,7 @@ from sglang.kernels.ops.attention.utils import (
     mla_quantize_and_rope_for_fp8,
     mla_quantize_for_fp8_no_rope,
 )
+from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
 from sglang.srt.configs.model_config import (
     get_dsa_index_kpool,
@@ -119,6 +120,7 @@ from sglang.srt.layers.dcp.layout import (
     get_dcp_lens,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import (
@@ -563,6 +565,89 @@ def _validate_flashmla_sparse_q8_backend(
         )
 
 
+# The DSA implementations whose latent-row reads go through
+# `DeepseekSparseAttnBackend.latent_kv_rows`: flashmla_kv's sparse indices, and
+# the prefix gathers of the RAGGED prefill kernels and of MHA one-shot.
+_ROW_INDEXED_DECODE_IMPLS = ("flashmla_kv",)
+_ROW_INDEXED_PREFILL_IMPLS = (
+    "flashmla_kv",
+    "flashmla_sparse",
+    "flashmla_sparse_q8",
+    "triton_sparse_mla",
+    "flashmla_auto",
+)
+
+
+def _validate_unified_pool_backend(
+    *,
+    rows_by_index: bool,
+    translates_ids: bool,
+    prefill_impl: str,
+    decode_impl: str,
+    index_kpool: int,
+    dcp_size: int,
+    speculative_algorithm: Optional[str],
+    return_indexer_topk: bool,
+    hisparse_enabled: bool,
+) -> None:
+    """Refuse what this backend does not serve from the unified memory pool.
+
+    ``rows_by_index``: the pool keeps a token's latent row at ``row_index`` of
+    its id, so every kernel that reads rows by token id must take the mapped
+    rows. ``translates_ids``: ``req_to_token`` holds virtual ids, which the
+    metadata translates to physical ones once per forward.
+    """
+    if rows_by_index:
+        if "trtllm" in (prefill_impl, decode_impl):
+            raise ValueError(
+                "--enable-unified-memory does not support the trtllm DSA "
+                "backend: it reads flat latent rows by token id, while the "
+                "unified pool interleaves each page's rows across layers. Use "
+                "flashmla_kv."
+            )
+        if decode_impl not in _ROW_INDEXED_DECODE_IMPLS:
+            raise ValueError(
+                "--enable-unified-memory supports --dsa-decode-backend "
+                f"{' / '.join(_ROW_INDEXED_DECODE_IMPLS)}; got {decode_impl!r}."
+            )
+        if prefill_impl not in _ROW_INDEXED_PREFILL_IMPLS:
+            raise ValueError(
+                "--enable-unified-memory supports --dsa-prefill-backend "
+                f"{' / '.join(_ROW_INDEXED_PREFILL_IMPLS)}; got {prefill_impl!r}."
+            )
+    if not translates_ids:
+        return
+    if index_kpool > 1:
+        raise ValueError(
+            "--enable-unified-memory does not support pooled indexer keys "
+            f"(index_kpool={index_kpool}) with DSA attention yet."
+        )
+    if dcp_size > 1:
+        raise ValueError(
+            "--enable-unified-memory does not support DSA attention with decode "
+            "context parallelism yet: the sharded indexer and its top-k read "
+            "rank-local slots, not the unified pool's physical ids."
+        )
+    if hisparse_enabled:
+        raise ValueError(
+            "--enable-unified-memory does not support --enable-hisparse with "
+            "DSA attention."
+        )
+    if return_indexer_topk:
+        raise ValueError(
+            "--enable-unified-memory does not support --enable-return-indexer-"
+            "topk with DSA attention: the top-k it would return names physical "
+            "slots of the unified pool, which move between iterations."
+        )
+    if speculative_algorithm is not None:
+        raise ValueError(
+            "--enable-unified-memory does not support speculative decoding with "
+            "DSA attention yet: draft top-k seeds (MTP seed indices, PD seed "
+            "remapping) and shared top-k state keep physical slots across "
+            f"iterations. Got --speculative-algorithm={speculative_algorithm!r}."
+        )
+
+
 class DeepseekSparseAttnBackend(
     DSAMetadataManagementMixin,
     DeepseekSparseAttnBackendKPoolMixin,
@@ -668,6 +753,9 @@ class DeepseekSparseAttnBackend(
         self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        # Translates the ids `req_to_token` holds into the physical ids the
+        # page tables carry (`_read_v2p`); identity on a static pool.
+        self.runner_ids = model_runner.runner_ids
 
         self.use_mha: bool = False
         # Dense MHA expands prefix KV outside the DSA metadata path. Keep
@@ -812,6 +900,18 @@ class DeepseekSparseAttnBackend(
             kv_cache_store_fp8=self.dsa_kv_cache_store_fp8,
             qk_rope_head_dim=self.qk_rope_head_dim,
             device_sm_major=self.device_sm_major,
+            hisparse_enabled=self.hisparse_coordinator is not None,
+        )
+        _validate_unified_pool_backend(
+            rows_by_index=self.token_to_kv_pool.addresses_rows_by_index,
+            translates_ids=self.runner_ids is not None
+            and self.runner_ids.is_translating,
+            prefill_impl=self.dsa_prefill_impl,
+            decode_impl=self.dsa_decode_impl,
+            index_kpool=self.dsa_index_kpool,
+            dcp_size=get_parallel().attn_dcp_size,
+            speculative_algorithm=get_spec().speculative_algorithm,
+            return_indexer_topk=get_exec().features.enable_return_indexer_topk,
             hisparse_enabled=self.hisparse_coordinator is not None,
         )
 
@@ -1229,6 +1329,45 @@ class DeepseekSparseAttnBackend(
             gathered = torch.cat([gathered, gathered.new_zeros(pad, gathered.shape[1])])
         return gathered.view(kv_cache.dtype)
 
+    def _read_v2p(self) -> Optional[torch.Tensor]:
+        """The full sub-pool's live virtual->physical page table when the ids
+        `req_to_token` holds are virtual (the unified pool), else None. Every
+        page table this backend builds goes through it once, so the indexer,
+        the top-k transforms and attention all read physical ids."""
+        runner_ids = self.runner_ids
+        if runner_ids is None or not runner_ids.reads_are_translated:
+            return None
+        assert runner_ids.page_size == self.real_page_span, (
+            f"the page table maps {runner_ids.page_size}-token pages; DSA reads "
+            f"{self.real_page_span}-token pages"
+        )
+        return runner_ids.space(IdSpaceKind.FULL).read_mapping()
+
+    def _v2p_kwargs(self) -> dict:
+        """`_read_v2p` for the fused metadata builders, which take none on a
+        static pool."""
+        v2p = self._read_v2p()
+        return {} if v2p is None else {"v2p": v2p}
+
+    def _physical_token_table(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """``token_ids`` gathered from `req_to_token`, as the physical ids the
+        pool's per-layer buffers are indexed by (unmapped ids read the sink)."""
+        v2p = self._read_v2p()
+        if v2p is None:
+            return token_ids
+        return translate_token_ids(
+            loc=token_ids, v2p=v2p, page_size=self.runner_ids.page_size
+        ).to(token_ids.dtype)
+
+    def latent_kv_rows(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """The rows of a layer's latent KV buffer holding ``token_ids``
+        (physical ids; -1 stays -1): the ids themselves, or `row_index` of them
+        on a pool that interleaves each page's rows across layers."""
+        pool = self.token_to_kv_pool
+        if not pool.addresses_rows_by_index:
+            return token_ids
+        return pool.row_index(token_ids)
+
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_span
         if page_size == 1:
@@ -1293,9 +1432,14 @@ class DeepseekSparseAttnBackend(
             # eager (e.g. over-capture-bs) fallback needs a length here.
             max_seqlen_k = int(forward_batch.seq_lens.max().item()) + draft_token_num
         # [b, max_seqlen_k]
-        page_table = self.req_to_token_pool.req_to_token[
-            forward_batch.req_pool_indices, :max_seqlen_k
-        ]
+        page_table = self._physical_token_table(
+            self.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, :max_seqlen_k
+            ]
+        )
+        reads_translated = (
+            self.runner_ids is not None and self.runner_ids.reads_are_translated
+        )
 
         kv_shard_extend = self._kv_shard_pool is not None and prepare_kv_shard_forward(
             self._kv_shard_pool, self.req_to_token, forward_batch
@@ -1512,6 +1656,9 @@ class DeepseekSparseAttnBackend(
                 if (
                     # Sharded extends index scratch rows, bounded by construction.
                     not kv_shard_extend
+                    # Translated ids come out of the sub-pool's own page table,
+                    # which names only pages it holds (or the sink).
+                    and not reads_translated
                     and forward_batch.seq_lens_sum > kv_cache_capacity
                     and not self.dsa_shards_index_k
                 ):
@@ -2006,6 +2153,8 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
 
         self.set_dsa_prefill_impl(forward_batch=None)
+        # Page tables carry physical ids; the builders translate as they fill.
+        v2p_kwargs = self._v2p_kwargs()
 
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
@@ -2035,6 +2184,7 @@ class DeepseekSparseAttnBackend(
                     max_len=max_len,
                     dsa_index_topk=self.dsa_index_topk,
                     physical_page_size=self.real_page_span,
+                    **v2p_kwargs,
                 )
                 cache_seqlens = metadata.cache_seqlens_int32
                 dsa_cache_seqlens = metadata.dsa_cache_seqlens_int32
@@ -2048,7 +2198,9 @@ class DeepseekSparseAttnBackend(
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
                 )
-                page_indices = self.req_to_token[req_pool_indices, :max_len]
+                page_indices = self._physical_token_table(
+                    self.req_to_token[req_pool_indices, :max_len]
+                )
                 metadata.page_table_1[:, :max_len].copy_(page_indices)
                 dsa_cache_seqlens = compute_dsa_seqlens(
                     cache_seqlens,
@@ -2093,6 +2245,7 @@ class DeepseekSparseAttnBackend(
                     physical_page_size=self.real_page_span,
                     next_n=self.speculative_num_draft_tokens,
                     paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
+                    **v2p_kwargs,
                 )
                 target_verify_ctx_lens_written = paged_mqa_ctx_lens_2d is not None
                 cache_seqlens = metadata.cache_seqlens_int32
@@ -2113,7 +2266,9 @@ class DeepseekSparseAttnBackend(
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
                 )
-                page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
+                page_indices = self._physical_token_table(
+                    self.req_to_token[req_pool_indices, :max_seqlen_k]
+                )
                 page_indices = torch.repeat_interleave(
                     page_indices, repeats=self.speculative_num_draft_tokens, dim=0
                 )
@@ -2182,6 +2337,7 @@ class DeepseekSparseAttnBackend(
                     max_extend_len=self.speculative_num_draft_tokens,
                     max_total_len=bs * self.speculative_num_draft_tokens,
                     static_extend_len=True,
+                    **v2p_kwargs,
                 )
                 cache_seqlens = metadata.cache_seqlens_int32
                 seqlens_expanded = metadata.dsa_seqlens_expanded[:total_extend_len]
@@ -2196,7 +2352,9 @@ class DeepseekSparseAttnBackend(
                     torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
                 )
 
-                page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
+                page_indices = self._physical_token_table(
+                    self.req_to_token[req_pool_indices, :max_seqlen_k]
+                )
                 page_indices = torch.repeat_interleave(
                     page_indices, repeats=self.speculative_num_draft_tokens, dim=0
                 )
@@ -2598,7 +2756,9 @@ class DeepseekSparseAttnBackend(
                             q_rope=q_rope,
                             kv_bf16=None,
                             paged_kv_cache=kv_cache,
-                            page_table_1_flattened=page_table_1_flattened,
+                            page_table_1_flattened=self.latent_kv_rows(
+                                page_table_1_flattened
+                            ),
                             page_table_1=page_table_1,
                             sm_scale=layer.scaling,
                             v_head_dim=layer.v_head_dim,
@@ -2643,7 +2803,7 @@ class DeepseekSparseAttnBackend(
                     )
                     assert page_table_1_flattened is not None
                     kv_cache = dequantize_k_cache_paged_dsa(
-                        kv_cache, page_table_1_flattened
+                        kv_cache, self.latent_kv_rows(page_table_1_flattened)
                     )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
@@ -3585,7 +3745,8 @@ class DeepseekSparseAttnBackend(
                 # SM90 needs static top-k; -1 padding masks nonlocal keys.
                 topk_length = None
             num_splits = None
-        indices = page_table_1.unsqueeze(1)
+        # FlashMLA reads row `i` of the kv_cache rows for index `i`.
+        indices = self.latent_kv_rows(page_table_1).unsqueeze(1)
         assert (
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
@@ -4591,6 +4752,8 @@ class DeepseekSparseAttnMultiStepBackend:
     # Per-step draft decode replays from precomputed GPU metadata; opt out so
     # decide_needs_cpu_seq_lens' OR over the backends stays False.
     needs_cpu_seq_lens: bool = False
+    # The runner's RunnerIds, as its per-step backends carry it.
+    runner_ids = None
 
     def __init__(
         self,
@@ -4599,6 +4762,7 @@ class DeepseekSparseAttnMultiStepBackend:
         speculative_num_steps: int,
         seed_dsa_topk_from_draft_extend: bool = False,
     ):
+        self.runner_ids = model_runner.runner_ids
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
